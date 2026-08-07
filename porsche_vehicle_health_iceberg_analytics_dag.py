@@ -10,16 +10,16 @@ from airflow.models.param import Param
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from cloudera.airflow.providers.operators.cde import CdeRunJobOperator
 
-from pipeline_settings import (
-    ANALYTICS_DATABASE,
-    CDE_CONNECTION_ID,
-    CDE_SPARK_JOB_NAME,
-    CURATED_S3_ROOT,
-    IMPALA_CONNECTION_ID,
-    RAW_S3_ROOT,
-    STAGING_DATABASE,
-    TEMP_S3_URI,
-)
+RAW_S3_ROOT = "s3a://porscheenv-buk-3b2308dc/data/porsche/raw/vehicle-health"
+CURATED_S3_ROOT = "s3a://porscheenv-buk-3b2308dc/data/porsche/curated/vehicle-health"
+TEMP_S3_URI = "s3a://porscheenv-buk-3b2308dc/data/porsche/tmp/vehicle-health"
+
+CDE_CONNECTION_ID = "awc-cde"
+CDE_SPARK_JOB_NAME = "spark-etl-pipeline"
+IMPALA_CONNECTION_ID = "datahub_impala"
+
+ANALYTICS_DATABASE = "porsche_vehicle_health_analytics"
+STAGING_DATABASE = "porsche_vehicle_health_analytics_staging"
 
 SQL_DIR = Path(__file__).resolve().parent / "sql"
 BUSINESS_DATE_TEMPLATE = (
