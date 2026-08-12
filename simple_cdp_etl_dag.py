@@ -16,7 +16,7 @@ from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from cloudera.airflow.providers.operators.cde import CdeRunJobOperator
 
 DAG_ID = "simple_cdp_sales_etl"
-CDE_CONN_ID = "sstcwocde"
+CDE_CONN_ID = "awc-cde"
 CDE_JOB_NAME = "simple-cdp-sales-etl"
 IMPALA_CONN_ID = "datahub_impala"
 
