@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-S3_BUCKET = "aws-ccf-ixen-backup"
+S3_BUCKET = "aws-ccf-smatyca-backup"
 AWS_REGION = "us-east-1"
 
 # Step 1 — raw input (zip under this prefix)
