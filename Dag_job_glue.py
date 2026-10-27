@@ -25,13 +25,19 @@ SUMMARY_TABLE = "callcenter_interaction_summary"
 
 
 def get_glue_client():
-    """Create a Glue client using the Airflow AWS connection."""
     hook = AwsBaseHook(
         aws_conn_id=AWS_CONN_ID,
         client_type="glue",
         region_name=AWS_REGION,
     )
-    return hook.get_client_type("glue")
+
+    session = hook.get_session()
+
+    return session.client(
+        "glue",
+        region_name=AWS_REGION,
+        endpoint_url="https://glue.us-west-1.amazonaws.com",
+    )
 
 
 def get_table_partitions(client, table_name):
