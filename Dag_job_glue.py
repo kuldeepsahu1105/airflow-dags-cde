@@ -3,32 +3,42 @@
 DAG: callcenter_sync_prod_v1
 
 Workflow:
-1. Read the source table location from AWS Glue.
-2. Discover interaction dates directly from Parquet files in S3.
-3. Compare discovered dates with registered summary-table partitions.
-4. Select the earliest unprocessed date.
-5. Run the existing CallCenterSummary CDE job.
+1. Read interactiondate values from source Parquet files.
+2. Read registered interactiondate partitions from AWS Glue summary table.
+3. Select the earliest date not yet summarized.
+4. Run the existing CDE job: CallCenterSummary.
 
-No separate CDE discovery job is required.
+Airflow connection: aws_glue
+CDE connection: awc-cde
+AWS region: us-west-1
 """
+
+from __future__ import annotations
+
+import logging
+from datetime import date, datetime, timedelta
+from urllib.parse import urlparse
 
 import pendulum
 
-from datetime import date, datetime
-from botocore.exceptions import ClientError
-
 from airflow import DAG
+from airflow.exceptions import AirflowException
 from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
 from airflow.providers.standard.operators.python import (
     PythonOperator,
     ShortCircuitOperator,
 )
-from cloudera.airflow.providers.operators.cde import CdeRunJobOperator
+
+from airflow.providers.cloudera.cde.operators.cde_operator import (
+    CdeRunJobOperator,
+)
 
 
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------
 # Configuration
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------
+
+DAG_ID = "callcenter_sync_prod_v1"
 
 AWS_CONN_ID = "aws_glue"
 CDE_CONN_ID = "awc-cde"
@@ -38,19 +48,33 @@ GLUE_DATABASE = "callcenter_data_s3"
 SOURCE_TABLE = "callcenter_interaction"
 SUMMARY_TABLE = "callcenter_interaction_summary"
 
-SOURCE_S3_LOCATION = (
-    "s3://ccf-psecoe-ccf-artifacts/"
-    "s3_flow_data/CCL/callcenter/"
-)
-
 SUMMARY_JOB_NAME = "CallCenterSummary"
 
+# Keep or remove the trailing slash as desired; the code normalizes it.
+SOURCE_S3_LOCATION = (
+    "s3://ccf-psecoe-ccf-artifacts/s3_flow_data/CCL/callcenter/"
+)
 
-# ---------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------
 # AWS clients
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------
 
-def get_aws_client(client_type):
+def get_aws_client(client_type: str):
+    """
+    Create a boto3 client using the Airflow AWS connection and an
+    explicitly configured regional endpoint.
+    """
+    endpoint_hosts = {
+        "glue": f"https://glue.{AWS_REGION}.amazonaws.com",
+        "s3": f"https://s3.{AWS_REGION}.amazonaws.com",
+    }
+
+    if client_type not in endpoint_hosts:
+        raise ValueError(f"Unsupported AWS client type: {client_type}")
+
     hook = AwsBaseHook(
         aws_conn_id=AWS_CONN_ID,
         client_type=client_type,
@@ -62,19 +86,12 @@ def get_aws_client(client_type):
     return session.client(
         client_type,
         region_name=AWS_REGION,
-        endpoint_url=(
-            f"https://{client_type}.{AWS_REGION}.amazonaws.com"
-        ),
+        endpoint_url=endpoint_hosts[client_type],
     )
 
 
-# ---------------------------------------------------------
-# Date normalization
-# ---------------------------------------------------------
-
-def normalize_date(value):
-    """Convert a Parquet interactiondate value into YYYY-MM-DD."""
-
+def normalize_date(value) -> str | None:
+    """Normalize supported date values to YYYY-MM-DD."""
     if value is None:
         return None
 
@@ -84,313 +101,340 @@ def normalize_date(value):
     if isinstance(value, date):
         return value.isoformat()
 
-    value = str(value).strip()
+    text_value = str(value).strip()
 
-    if not value:
+    if not text_value:
         return None
 
-    # Supports ISO date strings and ISO timestamps.
-    # For other formats, adapt this to the actual source schema.
+    # Handles ISO dates and timestamp strings.
     try:
-        return date.fromisoformat(value[:10]).isoformat()
+        return date.fromisoformat(text_value[:10]).isoformat()
     except ValueError:
-        raise ValueError(
-            f"Unsupported interactiondate value: {value!r}. "
-            "Update normalize_date() for the source date format."
-        )
+        logger.warning("Skipping unrecognized interactiondate: %r", value)
+        return None
 
 
-# ---------------------------------------------------------
-# Discover source dates directly from Parquet files in S3
-# ---------------------------------------------------------
+def normalize_s3_uri(uri: str) -> str:
+    """Normalize an S3 URI so a trailing slash does not affect comparison."""
+    parsed = urlparse(uri.strip())
 
-def discover_source_dates():
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError(f"Invalid S3 URI: {uri!r}")
+
+    path = parsed.path.strip("/")
+    return f"s3://{parsed.netloc}/{path}" if path else f"s3://{parsed.netloc}"
+
+
+# ---------------------------------------------------------------------
+# Discover source interaction dates
+# ---------------------------------------------------------------------
+
+def discover_source_dates() -> set[str]:
     """
-    Read only the interactiondate column from source Parquet files.
+    Read the interactiondate column from Parquet files under the
+    source Glue table location.
 
-    Requires pyarrow and s3fs in the Airflow task runtime.
-    Uses the AWS credentials from the aws_glue Airflow connection.
+    Requires pyarrow and s3fs to be available in the Airflow task
+    environment.
     """
-
     try:
-        import s3fs
         import pyarrow.parquet as pq
+        import s3fs
     except ImportError as exc:
-        raise RuntimeError(
-            "Date discovery requires 's3fs' and 'pyarrow' in the "
-            "Airflow task runtime. Install these dependencies in the "
-            "Airflow environment before running this DAG."
+        raise AirflowException(
+            "The Airflow task environment needs pyarrow and s3fs "
+            "to inspect the source Parquet files."
         ) from exc
 
-    hook = AwsBaseHook(
+    glue = get_aws_client("glue")
+
+    try:
+        response = glue.get_table(
+            DatabaseName=GLUE_DATABASE,
+            Name=SOURCE_TABLE,
+        )
+    except Exception as exc:
+        raise AirflowException(
+            f"Unable to retrieve Glue table "
+            f"{GLUE_DATABASE}.{SOURCE_TABLE}: {exc}"
+        ) from exc
+
+    table = response["Table"]
+    table_location = table.get("StorageDescriptor", {}).get("Location")
+
+    if not table_location:
+        raise AirflowException(
+            f"Glue table {GLUE_DATABASE}.{SOURCE_TABLE} "
+            "does not have a StorageDescriptor.Location."
+        )
+
+    # Fix: compare normalized URIs, not raw strings.
+    normalized_table_location = normalize_s3_uri(table_location)
+    normalized_source_location = normalize_s3_uri(SOURCE_S3_LOCATION)
+
+    if normalized_table_location != normalized_source_location:
+        raise AirflowException(
+            f"The Glue table location is {table_location!r}, but the "
+            f"configured source prefix is {SOURCE_S3_LOCATION!r}. "
+            "Verify SOURCE_S3_LOCATION before processing."
+        )
+
+    logger.info("Source Glue table location: %s", table_location)
+
+    # Use the same Airflow AWS connection for S3 access.
+    s3_hook = AwsBaseHook(
         aws_conn_id=AWS_CONN_ID,
         client_type="s3",
         region_name=AWS_REGION,
     )
-
-    credentials = hook.get_credentials()
+    credentials = s3_hook.get_credentials()
 
     filesystem = s3fs.S3FileSystem(
         key=credentials.access_key,
         secret=credentials.secret_key,
         token=credentials.token,
-        client_kwargs={"region_name": AWS_REGION},
+        client_kwargs={
+            "region_name": AWS_REGION,
+            "endpoint_url": f"https://s3.{AWS_REGION}.amazonaws.com",
+        },
     )
 
-    s3 = get_aws_client("s3")
+    # s3fs expects bucket/key rather than s3://bucket/key.
+    parsed_location = urlparse(table_location)
+    s3_prefix = f"{parsed_location.netloc}/{parsed_location.path.strip('/')}"
 
-    # Read Glue metadata to verify the table and its actual location.
-    glue = get_aws_client("glue")
-
-    table = glue.get_table(
-        DatabaseName=GLUE_DATABASE,
-        Name=SOURCE_TABLE,
-    )["Table"]
-
-    glue_location = table.get(
-        "StorageDescriptor", {}
-    ).get("Location", "")
-
-    if not glue_location:
-        raise ValueError(
-            f"No S3 storage location found for "
-            f"{GLUE_DATABASE}.{SOURCE_TABLE}"
-        )
-
-    expected_location = SOURCE_S3_LOCATION.rstrip("/") + "/"
-
-    if not glue_location.startswith(expected_location):
-        raise ValueError(
-            f"The Glue table location is {glue_location!r}, but the "
-            f"configured source prefix is {expected_location!r}. "
-            "Verify SOURCE_S3_LOCATION before processing."
-        )
-
-    bucket = glue_location.replace("s3://", "", 1).split("/", 1)[0]
-    prefix = glue_location.replace(
-        f"s3://{bucket}/", "", 1
-    ).rstrip("/") + "/"
-
-    paginator = s3.get_paginator("list_objects_v2")
-
-    parquet_keys = []
-
-    for page in paginator.paginate(
-        Bucket=bucket,
-        Prefix=prefix,
-    ):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-
-            if key.lower().endswith(".parquet"):
-                parquet_keys.append(key)
-
-    if not parquet_keys:
-        raise ValueError(
-            f"No Parquet files found under {glue_location}"
-        )
-
-    print(f"Source table: {GLUE_DATABASE}.{SOURCE_TABLE}")
-    print(f"Source location: {glue_location}")
-    print(f"Parquet files found: {len(parquet_keys)}")
-
-    source_dates = set()
-
-    for key in parquet_keys:
-        path = f"{bucket}/{key}"
-
-        with filesystem.open(path, "rb") as parquet_file:
-            parquet = pq.ParquetFile(parquet_file)
-
-            if "interactiondate" not in parquet.schema_arrow.names:
-                raise ValueError(
-                    f"'interactiondate' column not found in "
-                    f"s3://{bucket}/{key}. "
-                    f"Available columns: {parquet.schema_arrow.names}"
-                )
-
-            # Read only the date column, not the entire dataset.
-            date_table = parquet.read(
-                columns=["interactiondate"]
-            )
-
-            for value in date_table.column(
-                "interactiondate"
-            ).to_pylist():
-                normalized = normalize_date(value)
-
-                if normalized:
-                    source_dates.add(normalized)
-
-    print(f"Distinct source dates found: {len(source_dates)}")
-    print(f"Source dates: {sorted(source_dates)}")
-
-    if not source_dates:
-        raise ValueError(
-            "Parquet files were found, but no valid interactiondate "
-            "values were discovered."
-        )
-
-    return source_dates
-
-
-# ---------------------------------------------------------
-# Read processed dates from Glue summary partitions
-# ---------------------------------------------------------
-
-def get_summary_dates(glue):
-    """
-    Return registered interactiondate partitions.
-
-    If the summary table does not exist yet, return an empty set.
-    """
+    logger.info("Listing Parquet files under s3://%s", s3_prefix)
 
     try:
-        table = glue.get_table(
-            DatabaseName=GLUE_DATABASE,
-            Name=SUMMARY_TABLE,
-        )["Table"]
+        all_objects = filesystem.find(s3_prefix)
+    except Exception as exc:
+        raise AirflowException(
+            f"Unable to list objects under s3://{s3_prefix}: {exc}"
+        ) from exc
 
-    except ClientError as exc:
-        error_code = exc.response.get("Error", {}).get("Code")
-
-        if error_code == "EntityNotFoundException":
-            print(
-                f"Summary table {GLUE_DATABASE}.{SUMMARY_TABLE} "
-                "does not exist yet. All source dates are candidates."
-            )
-            return set()
-
-        raise
-
-    partition_keys = [
-        item["Name"]
-        for item in table.get("PartitionKeys", [])
+    parquet_files = [
+        path
+        for path in all_objects
+        if path.lower().endswith(".parquet")
     ]
 
-    if "interactiondate" not in partition_keys:
-        raise ValueError(
-            f"{SUMMARY_TABLE} must be partitioned by interactiondate. "
-            f"Found partition keys: {partition_keys}"
+    if not parquet_files:
+        logger.warning(
+            "No Parquet files found under s3://%s", s3_prefix
+        )
+        return set()
+
+    discovered_dates: set[str] = set()
+    files_without_date_column = 0
+
+    for file_path in parquet_files:
+        try:
+            with filesystem.open(file_path, "rb") as file_obj:
+                parquet_file = pq.ParquetFile(file_obj)
+
+                if "interactiondate" not in parquet_file.schema_arrow.names:
+                    files_without_date_column += 1
+                    logger.warning(
+                        "Skipping file without interactiondate column: %s",
+                        file_path,
+                    )
+                    continue
+
+                date_table = parquet_file.read(
+                    columns=["interactiondate"]
+                )
+
+                for value in date_table.column("interactiondate").to_pylist():
+                    normalized = normalize_date(value)
+                    if normalized:
+                        discovered_dates.add(normalized)
+
+        except Exception as exc:
+            raise AirflowException(
+                f"Failed reading interactiondate from "
+                f"s3://{file_path}: {exc}"
+            ) from exc
+
+    logger.info("Parquet files discovered: %d", len(parquet_files))
+    logger.info(
+        "Files without interactiondate column: %d",
+        files_without_date_column,
+    )
+    logger.info(
+        "Distinct source interaction dates discovered: %s",
+        sorted(discovered_dates),
+    )
+
+    return discovered_dates
+
+
+# ---------------------------------------------------------------------
+# Read registered summary-table partitions from Glue
+# ---------------------------------------------------------------------
+
+def get_summary_dates() -> set[str]:
+    """Return interactiondate values registered as Glue partitions."""
+    glue = get_aws_client("glue")
+
+    try:
+        response = glue.get_table(
+            DatabaseName=GLUE_DATABASE,
+            Name=SUMMARY_TABLE,
+        )
+    except glue.exceptions.EntityNotFoundException:
+        logger.info(
+            "Summary table %s.%s does not exist yet; "
+            "all discovered source dates will be considered missing.",
+            GLUE_DATABASE,
+            SUMMARY_TABLE,
+        )
+        return set()
+
+    table = response["Table"]
+    partition_keys = table.get("PartitionKeys", [])
+
+    if not any(
+        key.get("Name", "").lower() == "interactiondate"
+        for key in partition_keys
+    ):
+        raise AirflowException(
+            f"Glue summary table {GLUE_DATABASE}.{SUMMARY_TABLE} "
+            "must have an interactiondate partition key. "
+            f"Found: {partition_keys}"
         )
 
-    date_index = partition_keys.index("interactiondate")
-    summary_dates = set()
-
+    summary_dates: set[str] = set()
     paginator = glue.get_paginator("get_partitions")
 
-    for page in paginator.paginate(
-        DatabaseName=GLUE_DATABASE,
-        TableName=SUMMARY_TABLE,
-    ):
-        for partition in page.get("Partitions", []):
-            values = partition.get("Values", [])
+    try:
+        for page in paginator.paginate(
+            DatabaseName=GLUE_DATABASE,
+            TableName=SUMMARY_TABLE,
+        ):
+            for partition in page.get("Partitions", []):
+                values = partition.get("Values", [])
 
-            if len(values) > date_index:
-                normalized = normalize_date(values[date_index])
+                if not values:
+                    continue
 
+                normalized = normalize_date(values[0])
                 if normalized:
                     summary_dates.add(normalized)
 
-    print(f"Registered summary dates: {sorted(summary_dates)}")
+    except Exception as exc:
+        raise AirflowException(
+            f"Unable to retrieve partitions for "
+            f"{GLUE_DATABASE}.{SUMMARY_TABLE}: {exc}"
+        ) from exc
+
+    logger.info(
+        "Registered summary interaction dates: %s",
+        sorted(summary_dates),
+    )
 
     return summary_dates
 
 
-# ---------------------------------------------------------
-# Find the earliest unprocessed date
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------
+# Select the earliest missing date
+# ---------------------------------------------------------------------
 
-def fetch_missing_date(**context):
-    """Discover source dates and compare them against summary partitions."""
-
-    glue = get_aws_client("glue")
-
+def fetch_missing_date(**context) -> str | None:
+    """
+    Find the earliest source date that has no registered summary
+    partition. The selected date is pushed to XCom automatically.
+    """
     source_dates = discover_source_dates()
-    summary_dates = get_summary_dates(glue)
 
-    missing_dates = source_dates - summary_dates
-
-    print(f"Source date count: {len(source_dates)}")
-    print(f"Processed date count: {len(summary_dates)}")
-    print(f"Unprocessed dates: {sorted(missing_dates)}")
-
-    if not missing_dates:
-        print("No unprocessed interaction dates found.")
+    if not source_dates:
+        logger.info(
+            "No valid interaction dates were found in the source. "
+            "There is nothing to process."
+        )
         return None
 
-    selected_date = min(missing_dates)
+    summary_dates = get_summary_dates()
+    missing_dates = sorted(source_dates - summary_dates)
 
-    print(f"Selected interaction date: {selected_date}")
+    if not missing_dates:
+        logger.info(
+            "All discovered source dates already have summary "
+            "partitions. No CDE job is needed."
+        )
+        return None
+
+    selected_date = missing_dates[0]
+
+    logger.info("Selected earliest missing interaction date: %s", selected_date)
+    logger.info("Other missing dates, if any: %s", missing_dates[1:])
 
     return selected_date
 
 
-# ---------------------------------------------------------
-# Decide whether to run the summary job
-# ---------------------------------------------------------
-
-def select_interaction_date(**context):
-    """Skip the summary job if all dates are already processed."""
-
+def select_interaction_date(**context) -> bool:
+    """Allow the CDE task to run only when a missing date was found."""
     selected_date = context["ti"].xcom_pull(
         task_ids="fetch_missing_date"
     )
 
     if not selected_date:
-        print(
-            "No unprocessed interaction dates found. "
-            "Skipping the CDE summary job."
-        )
+        logger.info("No missing date selected; skipping the CDE job.")
         return False
 
-    print(f"Proceeding with interaction date: {selected_date}")
+    logger.info("A missing date was selected: %s", selected_date)
     return True
 
 
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------
 # DAG definition
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------
+
+default_args = {
+    "owner": "cloudera",
+    "depends_on_past": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=2),
+}
 
 with DAG(
-    dag_id="callcenter_sync_prod_v1",
+    dag_id=DAG_ID,
     description=(
-        "Discover unprocessed Call Center dates from Parquet "
-        "and run the existing CDE summary job."
+        "Discover unsummarized call-center interaction dates and "
+        "run the existing CDE summary job."
     ),
-    start_date=pendulum.datetime(2026, 6, 25, tz="UTC"),
+    default_args=default_args,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     schedule=None,
     catchup=False,
-    tags=["callcenter", "cde", "spark", "glue", "s3"],
+    dagrun_timeout=timedelta(hours=1),
+    tags=["callcenter", "glue", "cde"],
 ) as dag:
 
-    # Task 1: Discover source dates and identify the earliest missing date.
     fetch_missing = PythonOperator(
         task_id="fetch_missing_date",
         python_callable=fetch_missing_date,
     )
 
-    # Task 2: Continue only when an unprocessed date is available.
     select_date = ShortCircuitOperator(
         task_id="select_interaction_date",
         python_callable=select_interaction_date,
     )
 
-    # Task 3: Run the existing CDE summary job.
     run_summary = CdeRunJobOperator(
         task_id="run_callcenter_summary",
         job_name=SUMMARY_JOB_NAME,
-        connection_id=CDE_CONN_ID,
-        wait=True,
-        overrides={
-            "args": [
-                "{{ ti.xcom_pull(task_ids='fetch_missing_date') }} "
-                "--glue-database callcenter_data_s3 "
-                "--source-table callcenter_interaction "
-                "--summary-table callcenter_interaction_summary "
-                "--aws-region us-west-1"
-            ]
-        },
+        job_arguments=[
+            "{{ ti.xcom_pull(task_ids='fetch_missing_date') }}",
+            "--glue-database",
+            GLUE_DATABASE,
+            "--source-table",
+            SOURCE_TABLE,
+            "--summary-table",
+            SUMMARY_TABLE,
+            "--aws-region",
+            AWS_REGION,
+        ],
+        cde_conn_id=CDE_CONN_ID,
     )
 
     fetch_missing >> select_date >> run_summary
