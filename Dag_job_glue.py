@@ -348,7 +348,7 @@ with DAG(
     run_spark = CDEJobRunOperator(
         task_id="run_callcenter_summary",
         job_name=CDE_JOB_NAME,
-        connection_id=CDE_CONN_ID,
+        connection_id=CDE_CONN_ID, 
         variables={
             "interaction_date": (
                 "{{ ti.xcom_pull(task_ids='select_missing_date') }}"
