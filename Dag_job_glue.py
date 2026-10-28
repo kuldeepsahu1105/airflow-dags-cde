@@ -51,15 +51,21 @@ SUMMARY_JOB_NAME = "CallCenterSummary"
 # ---------------------------------------------------------
 
 def get_aws_client(client_type):
-    """Create an AWS client using the configured Airflow connection."""
-
     hook = AwsBaseHook(
         aws_conn_id=AWS_CONN_ID,
         client_type=client_type,
         region_name=AWS_REGION,
     )
 
-    return hook.get_client_type(client_type)
+    session = hook.get_session()
+
+    return session.client(
+        client_type,
+        region_name=AWS_REGION,
+        endpoint_url=(
+            f"https://{client_type}.{AWS_REGION}.amazonaws.com"
+        ),
+    )
 
 
 # ---------------------------------------------------------
