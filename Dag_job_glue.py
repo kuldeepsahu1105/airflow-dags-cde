@@ -1,6 +1,5 @@
 
 import logging
-from datetime import datetime
 from urllib.parse import urlparse
 
 import pendulum
@@ -34,7 +33,9 @@ SOURCE_S3_LOCATION = (
     "s3_flow_data/CCL/callcenter/"
 )
 
-DATE_COLUMN = "interactiondate"
+# Source Parquet column and summary Glue partition key
+SOURCE_DATE_COLUMN = "InteractionDate"
+SUMMARY_DATE_COLUMN = "interactiondate"
 
 
 default_args = {
@@ -74,20 +75,41 @@ def normalize_s3_uri(uri):
 
     path = parsed.path.strip("/")
 
-    return f"s3://{parsed.netloc}/{path}" if path else f"s3://{parsed.netloc}"
+    return (
+        f"s3://{parsed.netloc}/{path}"
+        if path
+        else f"s3://{parsed.netloc}"
+    )
 
 
 def normalize_date(value):
-    """Convert supported date values into YYYY-MM-DD strings."""
+    """
+    Normalize date values to YYYY-MM-DD.
+
+    Supports Python date/datetime values and strings beginning
+    with YYYY-MM-DD.
+    """
     if value is None:
         return None
 
     if hasattr(value, "isoformat"):
-        return value.isoformat()[:10]
+        value = value.isoformat()
 
     value = str(value).strip()
 
-    return value[:10] if value else None
+    if not value:
+        return None
+
+    # Expected source and Glue partition format: YYYY-MM-DD
+    date_part = value[:10]
+
+    try:
+        return pendulum.parse(date_part, strict=True).to_date_string()
+    except (ValueError, TypeError):
+        raise AirflowException(
+            f"Unsupported interaction date value: {value!r}. "
+            "Expected a value beginning with YYYY-MM-DD."
+        )
 
 
 # ---------------------------------------------------------
@@ -96,9 +118,11 @@ def normalize_date(value):
 
 def get_source_dates(glue):
     """
-    Read only the interactiondate column from source Parquet files.
-    The source table is not partitioned in Glue, so dates are
-    discovered from the actual data.
+    Read InteractionDate from source Parquet objects.
+
+    The Glue source table is not partitioned, so discover dates
+    from the actual data. S3 object keys do not require a .parquet
+    suffix, but the object contents must be valid Parquet files.
     """
     import pyarrow.parquet as pq
     import s3fs
@@ -138,11 +162,15 @@ def get_source_dates(glue):
     )
 
     parsed = urlparse(actual_location)
-    prefix = f"{parsed.netloc}/{parsed.path.strip('/')}"
+    bucket = parsed.netloc
+    prefix_path = parsed.path.strip("/")
+    prefix = f"{bucket}/{prefix_path}" if prefix_path else bucket
 
     all_files = filesystem.find(prefix)
 
-    parquet_files = [
+    # The observed S3 keys have UUID names without extensions.
+    # Do not filter data files by a .parquet suffix.
+    data_files = [
         path
         for path in all_files
         if not path.endswith("/")
@@ -150,35 +178,46 @@ def get_source_dates(glue):
         and not path.rsplit("/", 1)[-1].startswith(".")
     ]
 
+    logging.info("Source S3 location: %s", actual_location)
     logging.info("Total objects found: %d", len(all_files))
-    logging.info("Data files selected: %d", len(parquet_files))
+    logging.info("Data objects selected: %d", len(data_files))
 
-    if not parquet_files:
+    if not data_files:
         logging.warning(
-            "No Parquet files found under %s", actual_location
+            "No data objects found under %s",
+            actual_location,
         )
         return set()
 
     source_dates = set()
 
-    for file_path in parquet_files:
-        logging.info("Reading date column from %s", file_path)
+    for file_path in data_files:
+        logging.info("Reading source date column from %s", file_path)
 
-        with filesystem.open(file_path, "rb") as file_obj:
-            table = pq.read_table(
-                file_obj,
-                columns=[DATE_COLUMN],
-            )
+        try:
+            with filesystem.open(file_path, "rb") as file_obj:
+                table = pq.read_table(
+                    file_obj,
+                    columns=[SOURCE_DATE_COLUMN],
+                )
+        except Exception as exc:
+            raise AirflowException(
+                f"Failed to read '{SOURCE_DATE_COLUMN}' from "
+                f"S3 object '{file_path}'. Confirm the object is "
+                "valid Parquet and contains the expected column. "
+                f"Original error: {exc}"
+            ) from exc
 
-        for value in table.column(DATE_COLUMN).to_pylist():
+        for value in table.column(SOURCE_DATE_COLUMN).to_pylist():
             date_value = normalize_date(value)
 
             if date_value:
                 source_dates.add(date_value)
 
     logging.info(
-        "Discovered %d distinct source dates",
+        "Discovered %d distinct source dates: %s",
         len(source_dates),
+        sorted(source_dates),
     )
 
     return source_dates
@@ -215,14 +254,14 @@ def get_summary_dates(glue):
         for item in summary_table.get("PartitionKeys", [])
     ]
 
-    if DATE_COLUMN not in partition_keys:
+    if SUMMARY_DATE_COLUMN not in partition_keys:
         raise AirflowException(
             f"Summary table {GLUE_DATABASE}.{SUMMARY_TABLE} "
             f"does not have the expected partition key "
-            f"'{DATE_COLUMN}'. Found: {partition_keys}"
+            f"'{SUMMARY_DATE_COLUMN}'. Found: {partition_keys}"
         )
 
-    date_index = partition_keys.index(DATE_COLUMN)
+    date_index = partition_keys.index(SUMMARY_DATE_COLUMN)
     summary_dates = set()
 
     paginator = glue.get_paginator("get_partitions")
@@ -241,8 +280,9 @@ def get_summary_dates(glue):
                     summary_dates.add(date_value)
 
     logging.info(
-        "Found %d dates already summarized",
+        "Found %d dates already summarized: %s",
         len(summary_dates),
+        sorted(summary_dates),
     )
 
     return summary_dates
@@ -256,7 +296,8 @@ def discover_missing_date():
     """
     Return the earliest source date without a summary partition.
 
-    ShortCircuitOperator skips the CDE job if no date needs processing.
+    ShortCircuitOperator skips the CDE job if there is no
+    source date requiring processing.
     """
     glue = get_glue_client()
 
@@ -272,18 +313,21 @@ def discover_missing_date():
 
     if not missing_dates:
         logging.info(
-            "All source dates have summary partitions. Nothing to process."
+            "All source dates have summary partitions. "
+            "Nothing to process."
         )
         return False
 
     selected_date = missing_dates[0]
 
-    logging.info("Selected interaction date: %s", selected_date)
+    logging.info("Selected earliest missing interaction date: %s",
+                 selected_date)
+
     return selected_date
 
 
 # ---------------------------------------------------------
-# DAG
+# DAG definition
 # ---------------------------------------------------------
 
 with DAG(
