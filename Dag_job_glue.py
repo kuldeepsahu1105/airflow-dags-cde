@@ -29,10 +29,7 @@ from airflow.providers.standard.operators.python import (
     ShortCircuitOperator,
 )
 
-from airflow.providers.cloudera.cde.operators.cde_operator import (
-    CdeRunJobOperator,
-)
-
+from cloudera.airflow.providers.operators.cde import CdeRunJobOperator
 
 # ---------------------------------------------------------------------
 # Configuration
