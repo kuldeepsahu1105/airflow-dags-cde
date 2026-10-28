@@ -22,7 +22,7 @@ AWS_CONN_ID = "aws_glue"
 AWS_REGION = "us-west-1"
 
 CDE_CONN_ID = "awc-cde"
-CDE_JOB_NAME = "CallCenterSummary"
+CDE_JOB_NAME = "CallcenterInteractionSummary"
 
 GLUE_DATABASE = "callcenter_data_s3"
 SOURCE_TABLE = "callcenter_interaction"
