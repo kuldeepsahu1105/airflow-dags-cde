@@ -140,11 +140,18 @@ def get_source_dates(glue):
     parsed = urlparse(actual_location)
     prefix = f"{parsed.netloc}/{parsed.path.strip('/')}"
 
+    all_files = filesystem.find(prefix)
+
     parquet_files = [
         path
-        for path in filesystem.find(prefix)
-        if path.lower().endswith(".parquet")
+        for path in all_files
+        if not path.endswith("/")
+        and not path.rsplit("/", 1)[-1].startswith("_")
+        and not path.rsplit("/", 1)[-1].startswith(".")
     ]
+
+    logging.info("Total objects found: %d", len(all_files))
+    logging.info("Data files selected: %d", len(parquet_files))
 
     if not parquet_files:
         logging.warning(
